@@ -1,6 +1,7 @@
 use anyhow::{self, Error as AnyhowError};
+use axum::Router;
 use deployment::{Deployment, DeploymentError};
-use server::{DeploymentImpl, routes};
+use server::{DeploymentImpl, preview_proxy, routes};
 use services::services::container::ContainerService;
 use sqlx::Error as SqlxError;
 use strip_ansi_escapes::strip;
@@ -9,7 +10,7 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 use utils::{
     assets::asset_dir,
     browser::open_browser,
-    port_file::write_port_file,
+    port_file::write_port_file_with_proxy,
     sentry::{self as sentry_utils, SentrySource, sentry_layer},
 };
 
@@ -89,7 +90,6 @@ async fn main() -> Result<(), VibeKanbanError> {
         .or_else(|_| std::env::var("PORT"))
         .ok()
         .and_then(|s| {
-            // remove any ANSI codes, then turn into String
             let cleaned =
                 String::from_utf8(strip(s.as_bytes())).expect("UTF-8 after stripping ANSI");
             cleaned.trim().parse::<u16>().ok()
@@ -97,35 +97,68 @@ async fn main() -> Result<(), VibeKanbanError> {
         .unwrap_or_else(|| {
             tracing::info!("No PORT environment variable set, using port 0 for auto-assignment");
             0
-        }); // Use 0 to find free port if no specific port provided
+        });
+
+    let proxy_port = std::env::var("PREVIEW_PROXY_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(0);
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
-    let actual_port = listener.local_addr()?.port(); // get → 53427 (example)
 
-    // Write port file for discovery if prod, warn on fail
-    if let Err(e) = write_port_file(actual_port).await {
+    let main_listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
+    let actual_main_port = main_listener.local_addr()?.port();
+
+    let proxy_listener = tokio::net::TcpListener::bind(format!("{host}:{proxy_port}")).await?;
+    let actual_proxy_port = proxy_listener.local_addr()?.port();
+
+    preview_proxy::set_proxy_port(actual_proxy_port);
+
+    if let Err(e) = write_port_file_with_proxy(actual_main_port, Some(actual_proxy_port)).await {
         tracing::warn!("Failed to write port file: {}", e);
     }
 
-    tracing::info!("Server running on http://{host}:{actual_port}");
+    tracing::info!(
+        "Main server on :{}, Preview proxy on :{}",
+        actual_main_port,
+        actual_proxy_port
+    );
 
     if !cfg!(debug_assertions) {
         tracing::info!("Opening browser...");
+        let browser_port = actual_main_port;
         tokio::spawn(async move {
-            if let Err(e) = open_browser(&format!("http://127.0.0.1:{actual_port}")).await {
+            if let Err(e) = open_browser(&format!("http://127.0.0.1:{browser_port}")).await {
                 tracing::warn!(
                     "Failed to open browser automatically: {}. Please open http://127.0.0.1:{} manually.",
                     e,
-                    actual_port
+                    browser_port
                 );
             }
         });
     }
 
-    axum::serve(listener, app_router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let proxy_router: Router = preview_proxy::router();
+    let shutdown = shutdown_signal();
+
+    let main_server = axum::serve(main_listener, app_router);
+    let proxy_server = axum::serve(proxy_listener, proxy_router);
+
+    tokio::select! {
+        _ = shutdown => {
+            tracing::info!("Shutdown signal received");
+        }
+        result = main_server.into_future() => {
+            if let Err(e) = result {
+                tracing::error!("Main server error: {}", e);
+            }
+        }
+        result = proxy_server.into_future() => {
+            if let Err(e) = result {
+                tracing::error!("Preview proxy server error: {}", e);
+            }
+        }
+    }
 
     perform_cleanup_actions(&deployment).await;
 
