@@ -1,9 +1,6 @@
 name: Deploy Remote Prod
 
 on:
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version_type:
